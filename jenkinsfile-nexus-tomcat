@@ -1,0 +1,95 @@
+pipeline {
+    agent any
+    environment {
+        // Nexus repository credentials
+        NEXUS_URL = 'URL:8081'
+        NEXUS_CREDENTIALS_ID = 'nexus' // Credentials stored in Jenkins
+        ARTIFACT_GROUP = 'com.example'
+        ARTIFACT_NAME = 'simple-webapp'
+        SNAPSHOT_VERSION = '1.0-SNAPSHOT'
+        SNAPSHOT_VERSION_NUMBER = '1.0'
+        ARTIFACT_PACKAGING = 'war'
+        NEXUS_REPOSITORY = 'web-java'
+        XML_FILE = 'maven-metadata.xml'
+    }
+
+    stages {
+        stage('Download Metadata XML') {
+            agent {
+                label 'maven'
+            }
+            steps {
+                script {
+                    def metadataUrl = "${NEXUS_URL}/repository/${NEXUS_REPOSITORY}/${ARTIFACT_GROUP.replace('.', '/')}/${ARTIFACT_NAME}/${SNAPSHOT_VERSION}/${XML_FILE}"
+                    echo "Downloading metadata from ${metadataUrl}"
+                    
+                    withCredentials([usernamePassword(credentialsId: NEXUS_CREDENTIALS_ID, usernameVariable: 'NEXUS_USER', passwordVariable: 'NEXUS_PASSWORD')]) {
+                        sh """
+                            wget --user=${NEXUS_USER} --password=${NEXUS_PASSWORD} ${metadataUrl} -O "metadata.xml"
+                            ls -la
+                        """
+                    stash includes: 'metadata.xml', name: 'metadata'
+                    }
+                }
+            }
+        }
+        
+        stage('Parse Metadata and Download Latest WAR') {
+            steps {
+            agent {
+                label 'maven'
+            }
+            script {
+                unstash 'metadata'
+                sh 'ls -la'
+                def timestamp = sh(script: '''
+                xmllint --xpath '//snapshotVersion[extension="war"]/value/text()' metadata.xml
+                ''', returnStdout: true).trim()
+
+                echo "Latest snapshot version: ${timestamp}"
+
+                def artifactUrl = "${NEXUS_URL}/repository/${NEXUS_REPOSITORY}/${ARTIFACT_GROUP.replace('.', '/')}/${ARTIFACT_NAME}/${SNAPSHOT_VERSION}/${ARTIFACT_NAME}-${timestamp}.${ARTIFACT_PACKAGING}"
+                echo "Downloading latest WAR from ${artifactUrl}"
+
+                withCredentials([usernamePassword(credentialsId: NEXUS_CREDENTIALS_ID, usernameVariable: 'NEXUS_USER', passwordVariable: 'NEXUS_PASSWORD')]) {
+                sh """
+                    rm -rf *.war
+                    wget --user=${NEXUS_USER} --password=${NEXUS_PASSWORD} "${artifactUrl}"
+                """
+                }
+
+                stash includes: "*.war", name: 'artifact'
+            }
+            }
+        }
+
+        stage('Deploy to Tomcat') {
+            agent {
+                label 'tomcat'
+            }
+            steps {
+                script {
+                    sh 'rm -rf *.war *.jar'
+                    unstash 'artifact'
+                    echo 'Listing files in workspace after unstash'
+                    sh 'ls -l'
+                    
+                    // Deploy the WAR file to Tomcat
+                    sh "sudo rm -rf /opt/tomcat/webapps/ROOT"
+                    sh "curl -v -u manager:manager_password -T *.war http://${TOMCAT_URL}/manager/text/deploy?path=/&update=true"
+                    sh "sudo ls -l /opt/tomcat/webapps"
+                }
+            }
+        }
+        
+    }
+
+    post {
+        success {
+            echo 'Deployment successful!'
+        }
+        failure {
+            echo 'Deployment failed!'
+        }
+    }
+}
